@@ -3,30 +3,31 @@ package core
 import (
 	"context"
 	"fmt"
-	"github.com/danielmiessler/fabric/common"
-	"github.com/danielmiessler/fabric/db"
-	"github.com/danielmiessler/fabric/vendors"
+	"strings"
+
 	goopenai "github.com/sashabaranov/go-openai"
+
+	"github.com/danielmiessler/fabric/common"
+	"github.com/danielmiessler/fabric/plugins/ai"
+	"github.com/danielmiessler/fabric/plugins/db/fsdb"
+	"github.com/danielmiessler/fabric/plugins/template"
 )
 
+const NoSessionPatternUserMessages = "no session, pattern or user messages provided"
+
 type Chatter struct {
-	db *db.Db
+	db *fsdb.Db
 
 	Stream bool
 	DryRun bool
 
-	model  string
-	vendor vendors.Vendor
+	model              string
+	modelContextLength int
+	vendor             ai.Vendor
 }
 
-func (o *Chatter) Send(request *common.ChatRequest, opts *common.ChatOptions) (message string, err error) {
-	var chatRequest *Chat
-	if chatRequest, err = o.NewChat(request); err != nil {
-		return
-	}
-
-	var session *db.Session
-	if session, err = chatRequest.BuildChatSession(opts.Raw); err != nil {
+func (o *Chatter) Send(request *common.ChatRequest, opts *common.ChatOptions) (session *fsdb.Session, err error) {
+	if session, err = o.BuildSession(request, opts.Raw); err != nil {
 		return
 	}
 
@@ -34,10 +35,16 @@ func (o *Chatter) Send(request *common.ChatRequest, opts *common.ChatOptions) (m
 		opts.Model = o.model
 	}
 
+	if opts.ModelContextLength == 0 {
+		opts.ModelContextLength = o.modelContextLength
+	}
+
+	message := ""
+
 	if o.Stream {
 		channel := make(chan string)
 		go func() {
-			if streamErr := o.vendor.SendStream(session.Messages, opts, channel); streamErr != nil {
+			if streamErr := o.vendor.SendStream(session.GetVendorMessages(), opts, channel); streamErr != nil {
 				channel <- streamErr.Error()
 			}
 		}()
@@ -47,61 +54,103 @@ func (o *Chatter) Send(request *common.ChatRequest, opts *common.ChatOptions) (m
 			fmt.Print(response)
 		}
 	} else {
-		if message, err = o.vendor.Send(context.Background(), session.Messages, opts); err != nil {
+		if message, err = o.vendor.Send(context.Background(), session.GetVendorMessages(), opts); err != nil {
 			return
 		}
 	}
 
-	if chatRequest.Session != nil && message != "" {
-		chatRequest.Session.Append(&common.Message{Role: goopenai.ChatMessageRoleAssistant, Content: message})
-		err = o.db.Sessions.SaveSession(chatRequest.Session)
+	if message == "" {
+		session = nil
+		err = fmt.Errorf("empty response")
+		return
+	}
+
+	session.Append(&goopenai.ChatCompletionMessage{Role: goopenai.ChatMessageRoleAssistant, Content: message})
+
+	if session.Name != "" {
+		err = o.db.Sessions.SaveSession(session)
 	}
 	return
 }
 
-func (o *Chatter) NewChat(request *common.ChatRequest) (ret *Chat, err error) {
-	ret = &Chat{
-		Language: request.Language,
-	}
-
-	if request.ContextName != "" {
-		var ctx *db.Context
-		if ctx, err = o.db.Contexts.GetContext(request.ContextName); err != nil {
-			err = fmt.Errorf("could not find context %s: %v", request.ContextName, err)
-			return
-		}
-		ret.Context = ctx.Content
-	}
-
+func (o *Chatter) BuildSession(request *common.ChatRequest, raw bool) (session *fsdb.Session, err error) {
+	// If a session name is provided, retrieve it from the database
 	if request.SessionName != "" {
-		var sess *db.Session
-		if sess, err = o.db.Sessions.GetOrCreateSession(request.SessionName); err != nil {
+		var sess *fsdb.Session
+		if sess, err = o.db.Sessions.Get(request.SessionName); err != nil {
 			err = fmt.Errorf("could not find session %s: %v", request.SessionName, err)
 			return
 		}
-		ret.Session = sess
+		session = sess
+	} else {
+		session = &fsdb.Session{}
 	}
 
-	if request.PatternName != "" {
-		var pattern *db.Pattern
-		if pattern, err = o.db.Patterns.GetPattern(request.PatternName, request.PatternVariables); err != nil {
-			err = fmt.Errorf("could not find pattern %s: %v", request.PatternName, err)
+	if request.Meta != "" {
+		session.Append(&goopenai.ChatCompletionMessage{Role: common.ChatMessageRoleMeta, Content: request.Meta})
+	}
+
+	// if a context name is provided, retrieve it from the database
+	var contextContent string
+	if request.ContextName != "" {
+		var ctx *fsdb.Context
+		if ctx, err = o.db.Contexts.Get(request.ContextName); err != nil {
+			err = fmt.Errorf("could not find context %s: %v", request.ContextName, err)
 			return
 		}
+		contextContent = ctx.Content
+	}
 
-		if pattern.Pattern != "" {
-			ret.Pattern = pattern.Pattern
+	// Process any template variables in the message content (user input)
+	// Double curly braces {{variable}} indicate template substitution
+	// should occur, whether in patterns or direct input
+	if request.Message != nil {
+		request.Message.Content, err = template.ApplyTemplate(request.Message.Content, request.PatternVariables, "")
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	ret.Message = request.Message
-	return
-}
+	var patternContent string
+	if request.PatternName != "" {
+		pattern, err := o.db.Patterns.GetApplyVariables(request.PatternName, request.PatternVariables, request.Message.Content)
+		// pattrn will now contain user input, and all variables will be resolved, or errored
 
-type Chat struct {
-	Context  string
-	Pattern  string
-	Message  string
-	Session  *db.Session
-	Language string
+		if err != nil {
+			return nil, fmt.Errorf("could not get pattern %s: %v", request.PatternName, err)
+		}
+		patternContent = pattern.Pattern
+	}
+
+	systemMessage := strings.TrimSpace(contextContent) + strings.TrimSpace(patternContent)
+	if request.Language != "" {
+		systemMessage = fmt.Sprintf("%s. Please use the language '%s' for the output.", systemMessage, request.Language)
+	}
+
+	if raw {
+		if request.Message != nil {
+			if systemMessage != "" {
+				request.Message.Content = systemMessage
+				// system contains pattern which contains user input
+			}
+		} else {
+			if systemMessage != "" {
+				request.Message = &goopenai.ChatCompletionMessage{Role: goopenai.ChatMessageRoleSystem, Content: systemMessage}
+			}
+		}
+	} else {
+		if systemMessage != "" {
+			session.Append(&goopenai.ChatCompletionMessage{Role: goopenai.ChatMessageRoleSystem, Content: systemMessage})
+		}
+	}
+
+	if request.Message != nil {
+		session.Append(request.Message)
+	}
+
+	if session.IsEmpty() {
+		session = nil
+		err = fmt.Errorf(NoSessionPatternUserMessages)
+	}
+	return
 }
